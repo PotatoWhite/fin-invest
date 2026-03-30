@@ -47,7 +47,12 @@ async def main():
     collector_mgr = CollectorManager(db)
     collector_mgr.start()
 
-    # 3. Shutdown handler
+    # 3. Initialize Telegram bot
+    from bot.telegram import InvestBot
+    bot = InvestBot(db)
+    await bot.start()
+
+    # 4. Shutdown handler
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
@@ -60,11 +65,12 @@ async def main():
 
     logger.info("fin-invest running. Press Ctrl+C to stop.")
 
-    # 4. Wait for shutdown
+    # 5. Wait for shutdown
     await shutdown_event.wait()
 
-    # 5. Cleanup
+    # 6. Cleanup
     logger.info("Shutting down...")
+    await bot.stop()
     await collector_mgr.shutdown()
     logger.info("fin-invest stopped.")
 
