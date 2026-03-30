@@ -142,6 +142,38 @@ class CollectorManager:
             misfire_grace_time=60,
         )
 
+        # Signal detection: after each collection (every 70s)
+        self.scheduler.add_job(
+            self._detect_and_filter_signals,
+            "interval", seconds=POLLING_INTERVAL_SEC,
+            id="detect_signals",
+            misfire_grace_time=30,
+        )
+
+        # Prediction evaluation: hourly
+        self.scheduler.add_job(
+            self._evaluate_predictions,
+            "interval", seconds=3600,
+            id="evaluate_predictions",
+            misfire_grace_time=600,
+        )
+
+        # Event calendar check: hourly
+        self.scheduler.add_job(
+            self._check_events,
+            "interval", seconds=3600,
+            id="check_events",
+            misfire_grace_time=600,
+        )
+
+        # Report delivery check: every 30s (poll for new reports)
+        self.scheduler.add_job(
+            self._check_unsent_reports,
+            "interval", seconds=30,
+            id="check_unsent_reports",
+            misfire_grace_time=10,
+        )
+
         logger.info("Scheduler jobs registered")
 
     def start(self):
@@ -217,6 +249,44 @@ class CollectorManager:
 
     async def _db_compress(self):
         self.db.compress_old_realtime()
+
+    async def _detect_and_filter_signals(self):
+        from engine.signal_detector import detect_signals
+        from engine.signal_filter import run_filter_pipeline
+        from config import SIGNAL_QUALITY_TIER2_THRESHOLD
+
+        signals = detect_signals(self.db)
+        if not signals:
+            return
+
+        filtered = run_filter_pipeline(self.db, signals)
+
+        # Tier 2 alerts for high-quality signals
+        for fs in filtered:
+            if fs.final_quality >= SIGNAL_QUALITY_TIER2_THRESHOLD:
+                logger.info("Tier 2 alert: %s (quality=%.3f)",
+                            fs.signal.description, fs.final_quality)
+                # TODO: trigger Tier 2 analysis via Claude
+
+    async def _evaluate_predictions(self):
+        from engine.prediction_evaluator import evaluate_expired_predictions
+        evaluate_expired_predictions(self.db)
+
+    async def _check_events(self):
+        from scheduler.event_calendar import check_upcoming_events
+        check_upcoming_events(self.db)
+
+    async def _check_unsent_reports(self):
+        """Poll for reports that haven't been sent to Telegram yet."""
+        unsent = self.db.query(
+            "SELECT * FROM reports WHERE notification_sent=0 "
+            "AND content_telegram IS NOT NULL")
+        for report in unsent:
+            logger.info("Unsent report found: %s", report["cycle_id"])
+            # TODO: send via Telegram bot
+            self.db.execute(
+                "UPDATE reports SET notification_sent=1 WHERE id=?",
+                (report["id"],))
 
     async def _health_check(self):
         self.db.update_health("scheduler", "ok")
