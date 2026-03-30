@@ -16,6 +16,9 @@ logs/
 # Backups
 backups/
 
+# Data
+data/
+
 # IDE
 .idea/
 .vscode/

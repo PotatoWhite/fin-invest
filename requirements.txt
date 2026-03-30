@@ -1,0 +1,5 @@
+aiohttp>=3.9
+apscheduler>=3.10,<4
+python-telegram-bot>=22.0
+pykrx>=1.0.48
+mcp[cli]>=1.0
