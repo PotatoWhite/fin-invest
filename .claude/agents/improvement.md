@@ -27,13 +27,14 @@ tools: Read, Edit, Write, Grep, Glob, Bash, mcp__fin-invest__*
 - ❌ `.env` (인증)
 - ❌ `config.py` (핵심 설정)
 
-## 워크플로우
+## 워크플로우 (GitHub PR 기반)
 1. 정확도 데이터 분석
 2. 상위 3개 이슈 식별 (영향도 순)
-3. 각 이슈별: 근본 원인 진단 → 구체적 변경 제안 → 적용
+3. **GitHub Issue 생성** (`gh issue create`): 개선 제안 + 근거 데이터
 4. Git 브랜치 `improve/YYYYMMDD` 생성
-5. 변경 적용
-6. QA 에이전트에 핸드오프
+5. 각 이슈별: 근본 원인 진단 → 변경 적용 → commit
+6. **GitHub PR 생성** (`gh pr create`): Issue 참조, 변경 내용 설명
+7. QA 에이전트가 PR 리뷰
 
 ## 개선 우선순위
 1. 방향 적중률 < 55% — 편향 보정

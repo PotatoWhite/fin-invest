@@ -10,10 +10,11 @@ tools: Read, Bash, Grep, Glob, mcp__fin-invest__*
 ## 역할
 Git 저장소 관리, 배포/롤백, DB 유지보수.
 
-## Git 워크플로우
-- QA 통과 후 `improve/YYYYMMDD` 브랜치를 main에 머지
+## GitHub PR 기반 워크플로우
+- QA가 approve한 PR을 `gh pr merge`로 머지
 - 머지 후 배포 실행
-- 실패 시 자동 롤백
+- 실패 시: `git revert` → 새 PR로 롤백 → Issue 코멘트
+- 성공 시: PR에 "배포 완료" 코멘트
 
 ## 배포
 ```bash

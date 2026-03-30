@@ -26,9 +26,11 @@ tools: Read, Bash, Grep, Glob, mcp__fin-invest__*
    - 임계값: 0~1
    - 가중치: 0~5
 
-## 판정
-- PASS: 모든 검증 통과 → 자동 머지 + 배포 진행
-- FAIL: 하나라도 실패 → 브랜치 삭제 + 실패 사유 보고
+## GitHub PR 리뷰
+- `gh pr diff` 로 변경 내용 확인
+- 검증 실행 후 결과를 PR 코멘트로 작성
+- PASS: `gh pr review --approve` → DevOps가 머지
+- FAIL: `gh pr review --request-changes` → 실패 사유 코멘트
 
 ## 출력
 ```
