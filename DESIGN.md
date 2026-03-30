@@ -1,7 +1,3 @@
-Now I have all the information needed. Here is the complete system architecture design.
-
----
-
 # fin-invest System Architecture -- Complete Design
 
 ## 1. Project Structure
