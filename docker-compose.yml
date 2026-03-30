@@ -1,0 +1,19 @@
+services:
+  invest:
+    build: .
+    container_name: fin-invest
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+      - ./logs:/app/logs
+      - ./.claude:/app/.claude
+    environment:
+      - TZ=Asia/Seoul
+    healthcheck:
+      test: ["CMD", "python", "-c", "from db import check_health; check_health()"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
