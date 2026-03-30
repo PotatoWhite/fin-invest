@@ -40,7 +40,9 @@ invest/
 │   ├── naver_market.py              # FX, commodities, bonds, crypto (front-api)
 │   ├── yfinance_fallback.py         # US fundamentals, historical FX/commodity/bond/crypto
 │   ├── polymarket.py                # Polymarket CLOB/Gamma API
-│   └── upbit.py                     # Upbit crypto OHLCV history
+│   ├── upbit.py                     # Upbit crypto OHLCV history
+│   ├── finnhub.py                   # Finnhub: US news, economic calendar (Phase 3+)
+│   └── naver_news.py                # Naver News RSS for Korean stock news (Phase 3+)
 │
 ├── engine/
 │   ├── __init__.py
@@ -347,6 +349,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     agent_role TEXT NOT NULL,            -- 'leader', 'goguma', 'micro', etc.
     target_id TEXT NOT NULL,             -- '005930', 'NVDA', 'BTC'
     target_name TEXT,
+    target_type TEXT NOT NULL,           -- 'stock', 'crypto', 'index', 'fx', 'commodity', 'bond', 'polymarket'
 
     -- Prediction content (probability distribution)
     predicted_direction TEXT,            -- 'up', 'down', 'stable'
@@ -531,6 +534,20 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
 );
 
 -- ============================================================
+-- PENDING ACTIONS (Telegram confirmation flow)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,          -- 'add_stock', 'remove_stock', 'goguma_trade', etc.
+    params_json TEXT NOT NULL,          -- {"ticker": "005930", "name": "삼성전자", ...}
+    description TEXT,                   -- Human-readable description shown to user
+    status TEXT DEFAULT 'pending',      -- 'pending', 'approved', 'rejected', 'expired'
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    expires_at TEXT                     -- Auto-expire after 5 minutes
+);
+
+-- ============================================================
 -- REPORTS LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS reports (
@@ -542,6 +559,7 @@ CREATE TABLE IF NOT EXISTS reports (
     content_telegram TEXT,              -- Telegram-formatted summary
     content_notion_url TEXT,            -- Notion page URL
     duration_seconds INTEGER,
+    notification_sent INTEGER DEFAULT 0, -- 1 after Telegram+Notion delivery confirmed
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 
@@ -657,6 +675,11 @@ class BaseCollector(ABC):
 - Domestic: `polling...SERVICE_INDEX:KOSPI` (70s), `chart/domestic/index/KOSPI?periodType=dayCandle` (daily)
 - Foreign: `api.stock.naver.com/index/nation/USA` (70s during US market hours) for DJI, IXIC, INX, SOX, VIX
 
+On initial setup, backfill historical data for major indices using:
+- Domestic: `api.stock.naver.com/chart/domestic/index/KOSPI?periodType=dayCandle` (max range)
+- Foreign: `api.stock.naver.com/chart/foreign/index/.INX?periodType=dayCandle` (max range)
+This is handled by `scripts/backfill_history.py` alongside stock backfill.
+
 `collectors/naver_market.py`:
 - FX: `front-api/marketIndex/exchange/main` (5 min)
 - Commodities: `front-api/marketIndex/energy` + `metals` (5 min)
@@ -680,6 +703,12 @@ class BaseCollector(ABC):
 - Ongoing 5-min realtime price: Naver `front-api/crypto/top` (in naver_market.py)
 - Upbit is NOT called on 5-min schedule — only for historical OHLCV backfill
 
+**Data gaps to address in Phase 3+:**
+- Positioning (CFTC COT, 13F): No free real-time API. Design: agents use WebSearch to find latest COT reports. Manual entry via Telegram also supported.
+- Options flow (call/put ratio): yfinance `options` attribute for major US tickers. Add to `yfinance_fallback.py`.
+- Short interest: yfinance `info.shortPercentOfFloat` where available. Add to `yfinance_fallback.py`.
+- Cross-asset correlation: Computed by `engine/technical.py` on demand from stored price data. No separate table needed — calculated live from `stock_prices` + `market_indicators`.
+
 ### 3.3 Signal Detector
 
 `engine/signal_detector.py` runs after each collection cycle:
@@ -700,6 +729,15 @@ async def detect_signals(db: Database, new_data: list[dict]) -> list[Signal]:
 ```
 
 Each detected signal then passes through `engine/signal_filter.py` (the 7-filter pipeline). Each filter returns a score 0.0-1.0; the final quality is the product. Signals with `final_quality >= 0.7` trigger Tier 2 alerts; `0.4-0.7` are logged but not alerted; `< 0.4` are discarded.
+
+`engine/prediction_evaluator.py` also handles accuracy aggregation:
+After evaluating individual predictions, it aggregates results into `agent_accuracy` table:
+- Groups evaluated predictions by (agent_role, ISO week, regime)
+- Calculates direction_rate, avg_median_error, ci70_hit_rate, ci90_hit_rate
+- Computes calibration_score: correlation between confidence and actual hit rate
+- Detects systematic_bias: mean signed error (positive = bullish bias)
+- Updates ensemble_weight based on recent accuracy
+This runs as part of the hourly `evaluate_predictions` scheduler job.
 
 ### 3.4 Impact Calculator (3-Layer Model)
 
@@ -792,15 +830,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Stage 2: Claude Code for complex intents
+    # Send intermediate "analyzing" message
+    thinking_msg = await update.message.reply_text("🔍 분석 중...")
+
     response = await asyncio.to_thread(
         call_claude_for_intent, text, chat_id, reply_to, intent
     )
+
+    # Delete thinking message and send real response
+    await thinking_msg.delete()
     sent = await update.message.reply_text(response, parse_mode='Markdown')
     save_message(db, message_id=sent.message_id, chat_id=chat_id,
                  role='bot', text=response)
 ```
 
 ### 3.8 MCP Server
+
+**Performance note:** `mcp_server.py` is spawned fresh by Claude Code on every invocation.
+Keep module-level imports minimal. Heavy libraries (pandas, numpy) should use lazy imports:
+```python
+def get_technical(ticker: str) -> str:
+    import pandas as pd  # lazy import, only when this tool is called
+    ...
+```
 
 `mcp_server.py` using `FastMCP`:
 
@@ -833,7 +885,9 @@ def get_indices() -> str: ...
 def get_active_impacts(ticker: str) -> str: ...
 
 @mcp.tool()
-def get_causal_chain(ticker: str) -> str: ...
+def get_causal_chain(ticker: str = "", event_type: str = "") -> str:
+    """Get active causal chains. Filter by ticker and/or event_type."""
+    ...
 
 @mcp.tool()
 def get_geopolitical_risks() -> str: ...
@@ -905,6 +959,43 @@ def update_portfolio_snapshot(portfolio_type: str, holdings_json: str,
                                cash_json: str) -> str:
     """Replace entire portfolio with snapshot. For when user sends full holdings at once."""
     ...
+
+@mcp.tool()
+def update_model_param(category: str, param_name: str, value: float,
+                       updated_by: str = "improvement_agent") -> str:
+    """Update a model parameter. Used by improvement agent for tuning."""
+    ...
+
+@mcp.tool()
+def save_strategy_note(agent_role: str, content: str,
+                       valid_regime: str = "all") -> str:
+    """Save a strategy note for an agent. Auto-expires in 30 days."""
+    ...
+
+@mcp.tool()
+def add_stock(ticker: str, name: str, market: str, country: str = "KR") -> str:
+    """Add stock to watchlist and trigger historical backfill."""
+    ...
+
+@mcp.tool()
+def remove_stock(ticker: str) -> str:
+    """Deactivate stock from watchlist (soft delete)."""
+    ...
+
+@mcp.tool()
+def add_crypto(symbol: str, name: str, exchange: str = "UPBIT") -> str:
+    """Add crypto to watchlist."""
+    ...
+
+@mcp.tool()
+def add_polymarket(market_id: str, question: str, category: str = "") -> str:
+    """Add Polymarket event to watchlist."""
+    ...
+
+@mcp.tool()
+def get_market_data(category: str = "") -> str:
+    """Get FX, commodities, bonds data from market_indicators. Optional category filter."""
+    ...
 ```
 
 Registration in `.claude/settings.local.json`:
@@ -946,6 +1037,7 @@ Registration in `.claude/settings.local.json`:
 | `db_backup` | daily 04:00 | Always |
 | `db_compress` | daily 04:30 | Always (90-day minute data) |
 | `trigger_tier3_report` | See 9.5 | Schedule triggers |
+| `trigger_tier3_periodic` | 4 hours | During market hours (KST 09:00-05:00+1) |
 | `portfolio_snapshot` | daily 15:36 KST, 05:01 KST | Market close times |
 
 ---
@@ -961,9 +1053,25 @@ Two mechanisms:
 # bot/claude_bridge.py
 CLAUDE_PATH = "/home/linuxbrew/.linuxbrew/bin/claude"
 
+# Limit concurrent Claude Code invocations to prevent resource exhaustion
+_claude_semaphore = asyncio.Semaphore(3)  # max 3 concurrent processes
+
+async def call_claude_async(prompt: str, **kwargs) -> str:
+    async with _claude_semaphore:
+        return await asyncio.to_thread(call_claude, prompt, **kwargs)
+
+# Agent-specific model overrides
+AGENT_MODELS = {
+    "leader": "opus",
+    "goguma": "opus",
+}
+
 def call_claude(prompt: str, model: str = "sonnet",
                 allowed_tools: str = "mcp__fin-invest__*,WebSearch",
                 agent: str = "") -> str:
+    # Override model for specific agents
+    if agent and agent in AGENT_MODELS:
+        model = AGENT_MODELS[agent]
     cmd = [CLAUDE_PATH, '-p', prompt,
            '--model', model,
            '--allowedTools', allowed_tools]
@@ -993,6 +1101,10 @@ Schedule: "Tier 3 Report - US Market Close"
 Schedule: "Tier 3 Report - Korea Market Close"
   Cron: "40 15 * * 1-5"  # 15:40 KST Mon-Fri
   Prompt: "Run Korean market close report..."
+
+Schedule: "Tier 3 Report - Periodic 4h"
+  Cron: "0 */4 * * *"    # Every 4 hours
+  Prompt: "Run periodic Tier 3 report..."
 
 Schedule: "Daily Improvement Cycle"
   Cron: "0 6 * * *"      # 06:00 KST daily
@@ -1198,6 +1310,12 @@ When triggered by a schedule trigger, the leader agent:
 7. Leader calls `save_report()` MCP tool to persist the report to DB
 8. Python's health monitor polls `reports` table (10s interval), detects new report, pushes to Telegram (summary) + Notion (full)
 
+**CRITICAL: Goguma runs as a SEPARATE top-level Claude Code invocation, NOT as a subagent of the leader.**
+The report orchestrator in Python launches two parallel subprocess calls:
+1. `call_claude(prompt, agent="leader")` -- leader orchestrates experts
+2. `call_claude(prompt, agent="goguma")` -- goguma runs independently
+This ensures no context leakage from leader/experts to goguma. The Python process merges both results into the final report.
+
 ### 4.4 Telegram -> Claude Code -> Telegram Flow
 
 This is the critical path for user messages:
@@ -1310,6 +1428,13 @@ For anything that requires understanding, reasoning, or analysis:
 - "고구마야, 내 포폴 너무 IT에 쏠려있지 않아?"
 - "이번 주 FOMC 영향 어떻게 봐?"
 - Portfolio snapshot from screenshot (image handling)
+
+**Screenshot/Image handling:**
+When the user sends an image (photo) via Telegram:
+1. python-telegram-bot downloads the image to a temp file
+2. The image path is passed to Claude Code: `claude -p "이 증권사 스크린샷에서 보유 종목과 수량을 추출해줘" --image /tmp/screenshot.jpg`
+3. Claude Code (multimodal) reads the image, extracts holdings
+4. Returns structured data → Python updates user_portfolio via MCP
 
 ### 5.3 Action Confirmation Pattern
 
@@ -1629,6 +1754,6 @@ Files to create:
 ### Critical Files for Implementation
 - `/home/bravopotato/Spaces/finspace/invest/db.py` -- The entire schema and all CRUD operations. Everything depends on this.
 - `/home/bravopotato/Spaces/finspace/invest/mcp_server.py` -- The bridge between Claude Code agents and all financial data. Without this, agents are blind.
-- `/home/bravopotato/Spaces/finspace/invest/main.py` -- The asyncio entry point that starts all components (bot, scheduler, MCP server, health monitor).
+- `/home/bravopotato/Spaces/finspace/invest/main.py` -- The asyncio entry point that starts bot, scheduler, and health monitor. MCP server is a separate process spawned by Claude Code.
 - `/home/bravopotato/Spaces/finspace/invest/bot/claude_bridge.py` -- The subprocess integration that routes Telegram messages to Claude Code and back. This is the critical path for the natural language interface.
 - `/home/bravopotato/Spaces/finspace/invest/.claude/agents/leader.md` -- The leader agent prompt that orchestrates all analysis. Gets the multi-agent system right or wrong.
