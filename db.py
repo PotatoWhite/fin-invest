@@ -521,8 +521,14 @@ class Database:
             c.close()
 
     def _init_schema(self):
-        with self.conn() as c:
-            c.executescript(SCHEMA_SQL)
+        # Use raw connection for schema init (executescript manages its own transactions)
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        ddl = "\n".join(
+            line for line in SCHEMA_SQL.splitlines()
+            if not line.strip().upper().startswith("PRAGMA")
+        )
+        conn.executescript(ddl)
+        conn.close()
         logger.info("Database schema initialized: %s", self.db_path)
 
     def check_integrity(self) -> bool:
