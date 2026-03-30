@@ -22,19 +22,22 @@ class NaverFXCollector(BaseCollector):
         data = await self._get_json(NAVER_FRONT_EXCHANGE)
         records = []
 
-        for group in data if isinstance(data, list) else [data]:
-            for item in group.get("items", group.get("exchange", [])):
-                code = item.get("reutersCode", "")
-                if not code:
-                    continue
-                records.append({
-                    "timestamp": now,
-                    "category": "fx",
-                    "code": code,
-                    "name": item.get("name", ""),
-                    "value": _parse_price(item.get("closePrice", "")),
-                    "change_pct": _parse_price(item.get("fluctuationsRatio", "")),
-                })
+        items = data.get("result", []) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            items = []
+
+        for item in items:
+            code = item.get("reutersCode", "")
+            if not code:
+                continue
+            records.append({
+                "timestamp": now,
+                "category": "fx",
+                "code": code,
+                "name": item.get("name", ""),
+                "value": _parse_price(item.get("closePrice", "")),
+                "change_pct": _parse_price(item.get("fluctuationsRatio", "")),
+            })
 
         return records
 
@@ -59,9 +62,8 @@ class NaverCommodityCollector(BaseCollector):
                 logger.warning("Commodity fetch failed for %s: %s", url, e)
                 continue
 
-            items = data.get("mainList", data.get("result", []))
-            if not isinstance(items, list):
-                items = []
+            result = data.get("result", {}) if isinstance(data, dict) else {}
+            items = result.get("mainList", []) if isinstance(result, dict) else []
 
             for item in items:
                 code = item.get("symbolCode", item.get("reutersCode", ""))
@@ -100,7 +102,7 @@ class NaverBondCollector(BaseCollector):
                 logger.warning("Bond fetch failed for %s: %s", country, e)
                 continue
 
-            items = data if isinstance(data, list) else data.get("result", [])
+            items = data.get("result", []) if isinstance(data, dict) else data
             for item in items:
                 code = item.get("reutersCode", "")
                 if not code:
@@ -142,9 +144,8 @@ class NaverCryptoCollector(BaseCollector):
             return []
 
         records = []
-        items = data.get("result", data) if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            items = items.get("items", []) if isinstance(items, dict) else []
+        result = data.get("result", {}) if isinstance(data, dict) else {}
+        items = result.get("contents", []) if isinstance(result, dict) else []
 
         for item in items:
             symbol = item.get("nfTicker", "")

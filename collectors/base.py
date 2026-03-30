@@ -89,8 +89,14 @@ class BaseCollector(ABC):
         return 0
 
     async def _get_json(self, url: str, params: dict | None = None) -> dict:
-        """Helper: fetch JSON from URL."""
+        """Helper: fetch JSON from URL. Handles non-standard content types."""
         await self.ensure_session()
         async with self.session.get(url, params=params) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            # Some Naver APIs return text/plain with JSON content
+            try:
+                return await resp.json()
+            except Exception:
+                import json
+                text = await resp.text()
+                return json.loads(text)
