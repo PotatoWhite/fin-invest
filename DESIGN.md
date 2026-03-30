@@ -124,11 +124,15 @@ CREATE TABLE IF NOT EXISTS watched_stocks (
     ticker TEXT NOT NULL UNIQUE,         -- '005930' (KR) or 'NVDA' (US)
     name TEXT,                           -- '삼성전자'
     market TEXT DEFAULT 'KOSPI',         -- KOSPI, KOSDAQ, NYSE, NASDAQ, etc.
+    country TEXT DEFAULT 'KR',           -- 'KR', 'US', 'JP', 'EU' -- collector routing key
     reuters_code TEXT,                   -- 'NVDA.O' for Naver foreign chart API
     asset_type TEXT DEFAULT 'stock',     -- 'stock', 'etf', 'index'
     added_at TEXT DEFAULT (datetime('now','localtime')),
     active INTEGER DEFAULT 1
 );
+-- Collector routing: country='KR' → naver_stock.py (polling + integration + chart)
+--                    country='US' → naver chart/foreign + yfinance_fallback (fundamentals)
+--                    country='JP'/'EU' → naver chart/foreign only
 
 CREATE TABLE IF NOT EXISTS watched_polymarkets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -602,13 +606,12 @@ async def main():
     # 2. Start components concurrently
     await asyncio.gather(
         run_telegram_bot(db),         # python-telegram-bot 22.x async
-        run_mcp_server(db),           # FastMCP in background thread
         run_scheduler(db),            # APScheduler AsyncIOScheduler
         run_health_monitor(db),       # Periodic health checks
     )
 ```
 
-The MCP server runs in a background thread because `FastMCP.run()` uses its own stdio event loop. The Telegram bot, scheduler, and health monitor share the main asyncio loop.
+**MCP 서버는 별도 프로세스.** Claude Code가 `.claude/settings.local.json`에 등록된 MCP 서버를 subprocess로 직접 실행. main.py에 포함하지 않는다. `mcp_server.py`는 독립 실행 가능한 스크립트.
 
 ### 3.2 Data Collector Modules
 
@@ -672,8 +675,10 @@ class BaseCollector(ABC):
 - Probability shift detection feeds into signal_detector
 
 `collectors/upbit.py`:
-- Upbit REST API for crypto OHLCV candles (historical, 5 min candles)
-- Backfill on crypto watchlist addition
+- Upbit REST API for crypto OHLCV candles (historical backfill only)
+- Called once on crypto watchlist addition (max history backfill)
+- Ongoing 5-min realtime price: Naver `front-api/crypto/top` (in naver_market.py)
+- Upbit is NOT called on 5-min schedule — only for historical OHLCV backfill
 
 ### 3.3 Signal Detector
 
@@ -888,6 +893,18 @@ def update_geopolitical_risk(name: str, status: str, severity: int,
                               risk_premium_json: str,
                               escalation_prob: float,
                               resolution_prob: float) -> str: ...
+
+@mcp.tool()
+def save_report(cycle_id: str, report_type: str, content_telegram: str,
+                agents_activated: str, duration_seconds: int) -> str:
+    """Save report to DB. Python health monitor detects new reports and sends to Telegram/Notion."""
+    ...
+
+@mcp.tool()
+def update_portfolio_snapshot(portfolio_type: str, holdings_json: str,
+                               cash_json: str) -> str:
+    """Replace entire portfolio with snapshot. For when user sends full holdings at once."""
+    ...
 ```
 
 Registration in `.claude/settings.local.json`:
@@ -945,15 +962,11 @@ Two mechanisms:
 CLAUDE_PATH = "/home/linuxbrew/.linuxbrew/bin/claude"
 
 def call_claude(prompt: str, model: str = "sonnet",
-                max_budget: float = 3.0,
-                allowed_tools: str = "",
+                allowed_tools: str = "mcp__fin-invest__*,WebSearch",
                 agent: str = "") -> str:
     cmd = [CLAUDE_PATH, '-p', prompt,
            '--model', model,
-           '--max-budget-usd', str(max_budget),
-           '--permission-mode', 'bypassPermissions']
-    if allowed_tools:
-        cmd += ['--allowedTools', allowed_tools]
+           '--allowedTools', allowed_tools]
     if agent:
         cmd += ['--agent', agent]
     result = subprocess.run(
@@ -1182,7 +1195,8 @@ When triggered by a schedule trigger, the leader agent:
 4. Launches goguma as a separate parallel subagent
 5. Collects all results
 6. Synthesizes with Extended Thinking
-7. The schedule trigger's output is captured; Python's health monitor detects the new report and pushes to Telegram/Notion
+7. Leader calls `save_report()` MCP tool to persist the report to DB
+8. Python's health monitor polls `reports` table (10s interval), detects new report, pushes to Telegram (summary) + Notion (full)
 
 ### 4.4 Telegram -> Claude Code -> Telegram Flow
 
@@ -1481,7 +1495,33 @@ DB corruption
 
 ---
 
-## 8. Implementation Phases
+## 8. Test Strategy
+
+### 8.1 Test Levels
+
+| Level | 대상 | 방법 |
+|-------|------|------|
+| **Unit** | signal_filter, decay_engine, technical, regime_detector | pytest, 순수 함수 테스트 |
+| **Integration** | collectors, db CRUD, impact_calculator | pytest + SQLite in-memory DB |
+| **API Mock** | naver_stock, naver_market, polymarket | aioresponses로 HTTP 응답 모킹 |
+| **E2E** | 텔레그램 메시지 → 응답, 보고서 생성 | 수동 (Phase별 검증에서 커버) |
+
+### 8.2 Fixture Strategy
+
+- `tests/fixtures/naver_stock_basic.json` — 네이버 주식 basic API 응답 샘플
+- `tests/fixtures/naver_polling.json` — 네이버 폴링 API 응답 샘플
+- `tests/fixtures/polymarket_market.json` — 폴리마켓 마켓 응답 샘플
+- Phase 1에서 실제 API 응답을 캡처하여 fixture로 저장
+
+### 8.3 CI
+
+- `pytest tests/` — PR merge 전 QA 에이전트가 실행
+- py_compile 전체 파일 — 구문 오류 검사
+- 커버리지 목표: engine/ 80%+, collectors/ 60%+ (API 의존 부분은 mock)
+
+---
+
+## 9. Implementation Phases
 
 ### Phase 1: Core Infrastructure (Week 1)
 **Goal: Running daemon that collects data and stores it.**
