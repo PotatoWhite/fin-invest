@@ -23,7 +23,8 @@
 > "최초의 시작은 관련 종목의 최대한의 차트정보를 받아오면서 시작해야함"
 - 종목 추가 시 가용한 **최대 과거 데이터** 수집 (일봉 수년, 분봉 ~3개월)
 - 이후 70초 간격 실시간 수집으로 전환 (네이버 폴링 권장값)
-- 모든 데이터는 DB에 축적 (삭제 아닌 압축 보관)
+- 모든 데이터는 DB에 축적
+- **보관 정책**: 분봉 데이터 90일 후 일봉으로 압축, 일봉은 영구 보관
 
 ### 1.2 시장 데이터
 
@@ -47,6 +48,7 @@
 | **채권 금리** | 네이버 `front-api/marketIndex/bondList?countryCode=USA` | — | US 2Y/3Y/5Y/10Y/30Y, KR채권, 17개국 (실시간) | 5분 |
 | **채권 차트** | — (네이버 미지원) | yfinance | 금리 히스토리 | 1일1회 |
 | **종합 현황** | 네이버 `front-api/marketIndex/majors` | — | 환율+원자재+채권+금리 일괄 | 5분 |
+| **한국 ETF** | 네이버 `finance.naver.com/api/sise/etfItemList.nhn` | — | 전 종목 실시간 시세 | 5분 (장중) |
 
 > 참고: 네이버 폴링 API 권장 간격 70초 (`pollingInterval: 70000`). 5분 간격보다 네이버 권장값 사용.
 
@@ -180,6 +182,21 @@ signal_quality (
 - **잔류 효과**: 반감기 이후에도 불확실성 프리미엄이 남음 (지정학, 규제)
 
 > 이 값들은 초기값이며, 자기개선 시스템이 실측 데이터로 **레짐별로 지속 보정**.
+
+**파라미터 저장: DB `model_params` 테이블**
+```sql
+model_params (
+    id INTEGER PRIMARY KEY,
+    category TEXT NOT NULL,       -- 'half_life', 'impact_magnitude', 'regime', 'signal_filter'
+    param_name TEXT NOT NULL,     -- 'earnings_surprise_halflife_risk_on'
+    value REAL NOT NULL,          -- 120 (시간)
+    calibration_factor REAL DEFAULT 1.0,  -- 자기개선 보정계수
+    updated_by TEXT,              -- 'initial', 'improvement_agent', 'manual'
+    updated_at TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE(category, param_name)
+)
+```
+개선 에이전트가 이 테이블의 값을 수정 → 코드 변경 없이 파라미터 조정 가능.
 
 ### 3.2 충격 크기 모델 (Impact Magnitude)
 
@@ -401,6 +418,22 @@ Layer 3 (폴리마켓):
 | 전환기 | 18-25 | 혼재 | 변동 | 소규모, 양방향 대비 | 켈리 30% |
 | 위기 | >35 | 급확대 | 고갈 | 현금 극대화, 헤지 | 최소한 |
 
+**레짐 판별 알고리즘 (Python 자동):**
+```
+regime_score = (
+    vix_score(VIX)               × 0.35   -- VIX 수준
+  + spread_score(HY_spread)      × 0.25   -- HY 스프레드 변동
+  + breadth_score(advance_ratio) × 0.20   -- 시장폭
+  + flow_score(safe_haven_flow)  × 0.20   -- 안전자산 자금 흐름
+)
+
+regime_score > 0.7  → Risk-On
+regime_score 0.4~0.7 → 전환기
+regime_score 0.15~0.4 → Risk-Off
+regime_score < 0.15  → 위기
+```
+임계값은 `model_params` 테이블에 저장, 개선 에이전트가 조정 가능.
+
 ### 4.3 시간축별 최적 전략
 
 | 시간축 | 전략 | 도구 |
@@ -471,7 +504,47 @@ Kelly % = (승률 × 평균이익 - 패률 × 평균손실) / 평균이익
 - 현금 최소 15%
 - 1회 매매 최대 손실 = 총자산 2%
 
-### 5.5 "엣지 없으면 패스"
+### 5.5 예측 DB 스키마
+
+```sql
+predictions (
+    id INTEGER PRIMARY KEY,
+    cycle_id TEXT NOT NULL,              -- '2026-03-30T16:00'
+    agent_role TEXT NOT NULL,            -- 'leader', 'micro', 'goguma' 등
+    target_id TEXT NOT NULL,             -- '005930', 'NVDA', 'BTC'
+    target_name TEXT,                    -- '삼성전자'
+
+    -- 예측 내용 (확률 분포)
+    predicted_direction TEXT,            -- 'up', 'down', 'stable'
+    predicted_median_pct REAL,           -- 중앙값 변동률 (%)
+    predicted_ci70_low REAL,             -- 70% 구간 하한
+    predicted_ci70_high REAL,            -- 70% 구간 상한
+    predicted_ci90_low REAL,             -- 90% 구간 하한
+    predicted_ci90_high REAL,            -- 90% 구간 상한
+    confidence INTEGER,                  -- 확신도 (0-100)
+    reasoning TEXT,                      -- 요인 분해 + 근거
+
+    -- 메타
+    horizon TEXT NOT NULL,               -- '4h', '1d', '5d', '1m'
+    baseline_price REAL NOT NULL,        -- 예측 시점 가격
+    evaluation_at TEXT NOT NULL,          -- 검증 시점 (ISO 8601)
+    status TEXT DEFAULT 'pending',       -- 'pending', 'evaluated', 'skipped'
+
+    -- 검증 결과 (나중에 채움)
+    actual_price REAL,
+    actual_change_pct REAL,
+    direction_correct INTEGER,           -- 1=맞음, 0=틀림
+    median_error_pct REAL,               -- |예측 중앙값 - 실제|
+    in_ci70 INTEGER,                     -- 70% 구간 안에 들었나
+    in_ci90 INTEGER,                     -- 90% 구간 안에 들었나
+    score REAL,                          -- 종합 점수 (0-100)
+    evaluated_at TEXT,
+
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+)
+```
+
+### 5.6 "엣지 없으면 패스"
 > 모르겠다 = 유효한 결론. 매 사이클마다 예측 강제 금지.
 > 신호 품질 < 0.4이면 예측하지 않는다.
 
@@ -530,8 +603,8 @@ FOMC 발표 직후:      거시 + 금융 + 미국시장 + 리더 + 고구마
 | Tier | 트리거 | 내용 | 비용 |
 |------|--------|------|------|
 | **Tier 1: 감시** | 70초 간격, Python 자동 | 이상 탐지, 신호 품질 검증 | $0 |
-| **Tier 2: 긴급 알림** | 신호 품질 > 0.7인 이상 감지 시 | 관련 전문가만 긴급 분석 + 텔레그램 알림 | ~$0.10-0.30 |
-| **Tier 3: 정기 보고** | 4시간 or 시장 마감 후 | 전체 종합 분석 + 예측 + 고구마 | ~$0.50-1.50 |
+| **Tier 2: 긴급 알림** | 신호 품질 > 0.7인 이상 감지 시 | 관련 전문가만 긴급 분석 + 텔레그램 알림 | Claude Code 구독 내 |
+| **Tier 3: 정기 보고** | 4시간 or 시장 마감 후 | 전체 종합 분석 + 예측 + 고구마 | Claude Code 구독 내 |
 
 ### 7.2 정기 보고서 구성
 
@@ -716,7 +789,9 @@ strategy_notes (
 ├── get_crypto(symbol)                   — 암호화폐 시세
 ├── get_polymarket(market_id)            — 폴리마켓 확률
 ├── get_indices()                        — 글로벌 지표 일괄
-├── get_active_impacts(ticker)           — 활성 인과 사슬 + 잔여영향
+├── get_active_impacts(ticker)           — Layer 1 뉴스 잔여영향 + Layer 2 지정학 프리미엄 합산
+├── get_causal_chain(ticker)            — 활성 인과 사슬 (이벤트→1차→2차→3차)
+├── get_geopolitical_risks()            — 지정학 리스크 레지스터 (Layer 2)
 ├── get_signal_quality(ticker)           — 최근 신호 + 품질 점수
 ├── get_events(days_ahead)              — 이벤트 캘린더
 ├── get_regime()                         — 현재 레짐 판정
@@ -949,50 +1024,45 @@ Level 2: 시스템 개선 (운용팀, 일 1회)
   - Git 브랜치 관리, 머지, 배포, 롤백
 ```
 
----
+### 11.9 장애 자동 복구
 
-## 12. 장애 복구 및 모니터링
+**Python 프로세스:**
+- systemd 서비스 (`Restart=always`)
+- 헬스체크: 마지막 수집 시각 5분 초과 → 텔레그램 알림
+- 로그: `logs/`, 일별 로테이션
 
-### 11.1 Python 프로세스 안정성
-- systemd 서비스로 등록 → 크래시 시 자동 재시작 (`Restart=always`)
-- 헬스체크: 마지막 데이터 수집 시각이 5분 이상 지나면 텔레그램 알림
-- 로그: `logs/` 디렉토리, 일별 로테이션
-
-### 11.2 DB 보호
-- SQLite WAL 모드 (쓰기 중 읽기 가능)
-- 일일 백업 (cron, 압축 보관 7일)
-- DB 손상 감지: 시작 시 `PRAGMA integrity_check`
-
-### 11.3 API 장애 대응
-- 네이버 API 장애/차단 → pykrx/yfinance fallback 자동 전환
+**API 장애:**
+- 네이버 장애/차단 → pykrx/yfinance fallback 자동 전환
 - fallback도 실패 → 마지막 성공 데이터 유지 + 텔레그램 알림
-- 연속 실패 횟수 추적 → 5회 연속 실패 시 해당 소스 일시 중단 (30분 쿨다운)
+- 5회 연속 실패 → 해당 소스 30분 쿨다운
 
-### 11.4 시스템 상태 모니터링
-`/status` 명령으로 확인 가능:
-- 마지막 데이터 수집 시각 (소스별)
-- DB 크기, 레코드 수
-- 활성 에이전트 수, 마지막 보고서 시각
+**시스템 상태 (텔레그램 "시스템 상태" 질문으로 확인):**
+- 마지막 수집 시각 (소스별)
+- DB 크기, 레코드 수, 백업 상태
+- 활성 에이전트, 마지막 보고서 시각
 - API 오류 카운트 (24시간)
-- 네이버 API 상태 (정상/fallback 중)
+- 최근 개선/배포 이력
 
 ---
 
-## 13. 결정된 사항
+## 12. 결정된 사항
 - ✅ 언어: Python (AI/금융 라이브러리 풍부)
+- ✅ 실행: Claude Code 직접 사용 (API 아님), Max 구독
 - ✅ 데이터 소스: 네이버 API 최우선, yfinance는 fallback만
 - ✅ 고구마: 1억 현금, 초기 종목 없음, 스스로 판단
-- ✅ 보고 체계: 이벤트 구동 + 정기 하이브리드
-- ✅ 에이전트: 조건부 활성화, 최소 Sonnet 이상
+- ✅ 보고 체계: 이벤트 구동 + 정기 하이브리드 (3-Tier)
+- ✅ 에이전트: 분석팀(9명) + 운용팀(3명), 조건부 활성화, 최소 Sonnet
 - ✅ 예측: 확률 분포 출력, 점추정 금지, 엣지 없으면 패스
-- ✅ 자기개선: 보정(calibration) 중심, 전략 노트 유효기간 있음
-- ✅ 텔레그램: 자연어 처리, 제안→수락 패턴, 컨텍스트 유지
-- ✅ 비용: Claude Code Max 구독 기반, 품질 우선
-- ✅ 보고서 언어: 한국어
+- ✅ 충격 모델: 5요인 곱연산 (Base × Surprise × Regime × Positioning × Liquidity)
+- ✅ 3-Layer 모델: 이벤트 반감기 + 지정학 리스크 레지스터 + 폴리마켓 확률
+- ✅ 자기개선: Level 1 전략 노트(즉시) + Level 2 코드 개선(무인 배포)
+- ✅ 무인 운영: 시스템 개선/장애복구/모니터링은 자동, 매매 판단만 수동
+- ✅ 텔레그램: 자연어 처리, 2단계 의도 분류, 제안→수락, 컨텍스트 유지
 - ✅ 비트코인: 네이버 `front-api/crypto/top` (KRW + 김치프리미엄)
-- ✅ 뉴스 반감기: 레짐별 차등 적용, 감쇠 형태 4종
+- ✅ 뉴스 반감기: 레짐별 차등, 감쇠 형태 4종, 자기개선 보정
+- ✅ 파라미터: DB `model_params` 테이블 (코드 변경 없이 조정 가능)
+- ✅ 보고서 언어: 한국어
 
-## 14. 미결 사항
-1. ~~네이버 비트코인 API~~ → **해결: `front-api/crypto/top` 확인 완료**
-2. 초기 감시 종목 리스트 → 사용자가 텔레그램으로 자연어 추가
-3. 배포 환경 → 현재 서버 직접 실행? Docker?
+## 13. 미결 사항
+1. 초기 감시 종목 리스트 → 사용자가 텔레그램으로 자연어 추가
+2. 배포 환경 → 현재 서버 직접 실행? Docker?
