@@ -99,7 +99,111 @@ invest/
 │
 ├── backups/                         # DB backups (gitignored)
 ├── logs/                            # Log files (gitignored)
-└── invest.service                   # systemd unit file
+│
+├── Dockerfile                       # Python daemon image
+├── docker-compose.yml               # Service orchestration
+├── .dockerignore
+└── invest.service                   # systemd unit file (Docker host에서 compose 관리)
+```
+
+---
+
+## Docker 구성
+
+### Dockerfile
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl && rm -rf /var/lib/apt/lists/*
+
+# Claude Code CLI 설치
+RUN curl -fsSL https://claude.ai/install.sh | sh
+
+# Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Application code
+COPY . .
+
+# DB 및 로그 볼륨
+VOLUME ["/app/data", "/app/logs", "/app/backups"]
+
+# MCP 서버는 Claude Code가 별도 프로세스로 실행
+# main.py는 봇 + 스케줄러 + 헬스 모니터
+CMD ["python", "main.py"]
+```
+
+### docker-compose.yml
+```yaml
+services:
+  invest:
+    build: .
+    container_name: fin-invest
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/app/data          # invest.db 영속화
+      - ./backups:/app/backups    # DB 백업 영속화
+      - ./logs:/app/logs          # 로그 영속화
+      - ./.claude:/app/.claude    # Claude Code 설정 + 에이전트 (호스트와 공유)
+    environment:
+      - TZ=Asia/Seoul
+    # 헬스체크: 마지막 데이터 수집이 5분 이내인지
+    healthcheck:
+      test: ["CMD", "python", "-c", "import db; db.check_health()"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+```
+
+### 볼륨 전략
+```
+호스트                    컨테이너
+./data/invest.db    →    /app/data/invest.db      # DB 영속화
+./backups/          →    /app/backups/             # 백업 영속화
+./logs/             →    /app/logs/                # 로그 영속화
+./.claude/          →    /app/.claude/             # 에이전트 + MCP 설정
+.env                →    env_file                  # 환경변수
+```
+
+### 배포 흐름
+```
+개선 에이전트 → QA 통과 → main 머지
+  → docker compose build --no-cache
+  → docker compose up -d
+  → 헬스체크 (30초)
+  → 성공: 텔레그램 알림
+  → 실패: docker compose down → git revert → docker compose up -d → 텔레그램 알림
+```
+
+### Claude Code in Docker
+- Claude Code CLI를 컨테이너 안에 설치
+- `.claude/` 디렉토리를 호스트와 볼륨 공유 → 에이전트 프롬프트 수정이 컨테이너 재빌드 없이 반영
+- MCP 서버(`mcp_server.py`)는 컨테이너 안에서 Claude Code가 subprocess로 실행
+- Schedule trigger는 Claude Code cloud에서 실행 → MCP는 컨테이너 안의 서버에 연결
+
+### invest.service (Docker host)
+```ini
+[Unit]
+Description=fin-invest Docker Compose
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/bravopotato/Spaces/finspace/invest
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 Key differences from DESIGN.md (the earlier simpler sketch): the earlier DESIGN.md describes a minimal prototype (just stock+polymarket, 4-hour reports, slash commands). This architecture is the full REQUIREMENTS.md system with multi-agent analysis, signal filtering, causal chain tracking, 3 portfolios, and autonomous operations.
