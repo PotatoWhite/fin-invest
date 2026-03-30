@@ -174,6 +174,40 @@ class CollectorManager:
             misfire_grace_time=10,
         )
 
+        # ─── Report schedules ───
+
+        # 아침 뉴스 브리핑 (08:30 KST, 평일)
+        self.scheduler.add_job(
+            self._morning_briefing,
+            "cron", hour=8, minute=30, day_of_week="mon-fri",
+            id="morning_briefing",
+            misfire_grace_time=600,
+        )
+
+        # 한국 장 마감 보고서 (15:40 KST, 평일)
+        self.scheduler.add_job(
+            self._kr_market_close,
+            "cron", hour=15, minute=40, day_of_week="mon-fri",
+            id="kr_market_close",
+            misfire_grace_time=600,
+        )
+
+        # 미국 장 마감 보고서 (05:05 KST, 화-토)
+        self.scheduler.add_job(
+            self._us_market_close,
+            "cron", hour=5, minute=5, day_of_week="tue-sat",
+            id="us_market_close",
+            misfire_grace_time=600,
+        )
+
+        # 30분마다 할 일 체크
+        self.scheduler.add_job(
+            self._periodic_check,
+            "interval", minutes=30,
+            id="periodic_check_30min",
+            misfire_grace_time=120,
+        )
+
         logger.info("Scheduler jobs registered")
 
     def start(self):
@@ -287,6 +321,22 @@ class CollectorManager:
             self.db.execute(
                 "UPDATE reports SET notification_sent=1 WHERE id=?",
                 (report["id"],))
+
+    async def _morning_briefing(self):
+        from scheduler.report_scheduler import morning_briefing
+        morning_briefing(self.db)
+
+    async def _kr_market_close(self):
+        from scheduler.report_scheduler import kr_market_close_report
+        kr_market_close_report(self.db)
+
+    async def _us_market_close(self):
+        from scheduler.report_scheduler import us_market_close_report
+        us_market_close_report(self.db)
+
+    async def _periodic_check(self):
+        from scheduler.report_scheduler import periodic_check_30min
+        periodic_check_30min(self.db)
 
     async def _health_check(self):
         self.db.update_health("scheduler", "ok")
